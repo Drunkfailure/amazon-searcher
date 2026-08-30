@@ -19,6 +19,9 @@ class FakeElement:
 	def get_dom_attribute(self, name):
 		return self.attributes.get(name)
 
+	def get_attribute(self, name):
+		return self.attributes.get(name)
+
 	def is_displayed(self):
 		return self.displayed
 
@@ -37,5 +40,6 @@ class FakeElement:
 class FakeDriver(FakeElement):
 	"""A driver behaves like an element for the lookups used here."""
 
-	def __init__(self, children=None):
+	def __init__(self, children=None, current_url="https://www.amazon.com/"):
 		super().__init__(children=children)
+		self.current_url = current_url

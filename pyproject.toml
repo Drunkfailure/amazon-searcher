@@ -1,7 +1,7 @@
 [project]
-name = "bing-rewards-bot"
+name = "amazon-searcher"
 version = "0.1.0"
-description = "Script to farm MS Rewards points on desktop"
+description = "Search Amazon Kindle and harvest book links from result cards"
 authors = [
     {name = "Carl Furtado",email = "user0332@duck.com"}
 ]

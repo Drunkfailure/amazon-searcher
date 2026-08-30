@@ -1,9 +1,8 @@
-"""Tests for the parts of element_selectors that parse or choose.
+"""Tests for the Amazon Kindle card parsers and filters.
 
-Every case here is a bug that reached a real run: a point value the parser could
-not read, the wrong row of the breakdown panel, a container that looks right but
-is empty, and a label that matches two different buttons. They need no browser,
-so they run anywhere.
+Every case here is a failure mode that would silently drop books or invent
+links: an empty data-asin placeholder, a disabled Next button, a href that
+is not yet a canonical /dp/ URL. They need no browser, so they run anywhere.
 
 	python -m unittest discover -s tests
 """
@@ -20,174 +19,226 @@ from selenium.webdriver.common.by import By
 import element_selectors
 from fakes import FakeDriver, FakeElement
 
-STATUS_SELECTOR = "div.flex.w-full.items-center.gap-2"
-
-
-def card(status_text=None, points_text=None):
-	"""A misc card, optionally with a status block and a point value in it."""
-	if status_text is None and points_text is None:
-		return FakeElement()
-
-	status_children = {}
-
-	if points_text is not None:
-		status_children[(By.TAG_NAME, "p")] = [FakeElement(text=points_text)]
-
-	status = FakeElement(text=status_text or "", children=status_children)
-
-	return FakeElement(children={(By.CSS_SELECTOR, STATUS_SELECTOR): [status]})
-
-
-def sidebar_driver(panel_text):
-	"""A driver whose only section is the react-aria sidebar panel."""
-	panel = FakeElement(text=panel_text, attributes={"id": "react-aria-42"})
-
-	return FakeDriver(children={(By.TAG_NAME, "section"): [panel]})
-
 
 def selectors_for(driver):
 	return element_selectors.ElementSelectionUtils(driver)
 
 
-class CardPointValue(unittest.TestCase):
-	def test_reads_the_rendered_plus_prefix(self):
-		# The page renders "+10". int() happens to accept that, which hid the
-		# fragility until a variant added a unit.
-		self.assertEqual(selectors_for(FakeDriver()).get_card_point_value(card(points_text="+10")), 10)
+def result_card(
+	asin="B0ABC12345",
+	title="The Example Book",
+	href=None,
+	author="Jane Doe",
+	price="$4.99",
+	sponsored=False,
+	displayed=True,
+	css_class="",
+):
+	if href is None:
+		href = f"/The-Example-Book-ebook/dp/{asin}/ref=sr_1_1"
 
-	def test_reads_a_value_with_a_unit(self):
-		self.assertEqual(selectors_for(FakeDriver()).get_card_point_value(card(points_text="10 points")), 10)
+	title_link = FakeElement(text=title, attributes={"href": href})
+	byline = FakeElement(text=f"by {author}") if author else None
+	price_node = FakeElement(text=price) if price else None
+	spans = [FakeElement(text="Sponsored")] if sponsored else []
 
-	def test_is_zero_when_the_card_has_no_point_value(self):
-		# Promo cards carry a status block without a value.
-		self.assertEqual(selectors_for(FakeDriver()).get_card_point_value(card(status_text="")), 0)
+	children = {
+		(By.CSS_SELECTOR, "h2 a"): [title_link],
+		(By.CSS_SELECTOR, '[data-cy="title-recipe"] h2'): [FakeElement(text=title)],
+	}
 
-	def test_is_zero_when_the_card_has_no_status_block(self):
-		self.assertEqual(selectors_for(FakeDriver()).get_card_point_value(card()), 0)
+	if byline is not None:
+		children[(By.CSS_SELECTOR, '[data-cy="byline-recipe"]')] = [byline]
+		children[(By.CSS_SELECTOR, ".a-row")] = [byline]
 
+	if price_node is not None:
+		children[(By.CSS_SELECTOR, ".a-price .a-offscreen")] = [price_node]
 
-class CardCompletion(unittest.TestCase):
-	def test_completed_card(self):
-		self.assertTrue(selectors_for(FakeDriver()).card_is_complete(card(status_text="Completed")))
+	if spans:
+		children[(By.TAG_NAME, "span")] = spans
 
-	def test_open_card_showing_its_reward(self):
-		self.assertFalse(selectors_for(FakeDriver()).card_is_complete(card(status_text="+10")))
+	classes = css_class
+	if sponsored and "AdHolder" not in classes:
+		classes = (classes + " AdHolder").strip()
 
-	def test_card_without_a_status_block_is_not_complete(self):
-		self.assertFalse(selectors_for(FakeDriver()).card_is_complete(card()))
-
-
-class SearchPointsRow(unittest.TestCase):
-	PANEL = "\n".join([
-		"Points breakdown",
-		"Today's points",
-		"41",
-		"Bing search",
-		"6/15",
-		"Offers",
-		"20",
-		"This month",
-		"3,037",
-		"Lifetime",
-		"12,742",
-	])
-
-	def test_reads_the_bing_search_row(self):
-		earned, maximum = selectors_for(
-			sidebar_driver(self.PANEL)
-		).get_points_earned_from_searches_on_points_breakdown()
-
-		self.assertEqual((earned, maximum), (6, 15))
-
-	def test_ignores_rows_that_are_not_the_search_row(self):
-		# Several rows share the same value class in the real panel, so a
-		# position based read returns whichever row happens to come first.
-		reordered = "\n".join([
-			"Points breakdown",
-			"This month",
-			"3,037",
-			"Bing search",
-			"6/15",
-		])
-
-		earned, maximum = selectors_for(
-			sidebar_driver(reordered)
-		).get_points_earned_from_searches_on_points_breakdown()
-
-		self.assertEqual((earned, maximum), (6, 15))
-
-	def test_handles_a_thousands_separator_in_the_fraction(self):
-		panel = "Bing search\n1,020/1,500"
-
-		earned, maximum = selectors_for(
-			sidebar_driver(panel)
-		).get_points_earned_from_searches_on_points_breakdown()
-
-		self.assertEqual((earned, maximum), (1020, 1500))
-
-	def test_raises_when_the_panel_has_no_fraction(self):
-		with self.assertRaises(NoSuchElementException):
-			selectors_for(
-				sidebar_driver("Points breakdown\nLoading...")
-			).get_points_earned_from_searches_on_points_breakdown()
+	return FakeElement(
+		text=f"{'Sponsored ' if sponsored else ''}{title}\nby {author}\n{price}",
+		attributes={"data-asin": asin, "data-component-type": "s-search-result", "class": classes},
+		children=children,
+		displayed=displayed,
+	)
 
 
-class DuplicatedContainer(unittest.TestCase):
-	"""Some sections are emitted twice for responsive layout."""
+class AsinAndUrl(unittest.TestCase):
+	def test_reads_asin_from_dp_href(self):
+		self.assertEqual(
+			element_selectors.asin_from_href("/The-Example-Book-ebook/dp/B0ABC12345/ref=sr_1_1"),
+			"B0ABC12345",
+		)
 
-	def _driver(self, visible_links, hidden_links):
-		def container(displayed, count):
-			links = [FakeElement(text=f"card {i}") for i in range(count)]
+	def test_reads_asin_from_gp_product_href(self):
+		self.assertEqual(
+			element_selectors.asin_from_href("https://www.amazon.com/gp/product/B00TESTAS1"),
+			"B00TESTAS1",
+		)
 
-			return FakeElement(
-				displayed=displayed,
-				children={(By.TAG_NAME, "a"): links},
-			)
+	def test_returns_none_when_href_has_no_asin(self):
+		self.assertIsNone(element_selectors.asin_from_href("/s?k=mystery"))
 
+	def test_normalize_accepts_a_bare_asin(self):
+		self.assertEqual(element_selectors.normalize_asin("b0abc12345"), "B0ABC12345")
+
+	def test_product_url_is_canonical(self):
+		self.assertEqual(
+			element_selectors.product_url("b0abc12345"),
+			"https://www.amazon.com/dp/B0ABC12345",
+		)
+
+
+class ResultCardFilter(unittest.TestCase):
+	def _driver(self, cards):
 		return FakeDriver(children={
-			(By.ID, "moreactivities"): [
-				container(True, visible_links),
-				container(False, hidden_links),
-			]
+			(By.CSS_SELECTOR, 'div[data-component-type="s-search-result"]'): cards
 		})
 
-	def test_refuses_the_hidden_copy_even_though_it_has_the_links(self):
-		# The visible copy is the empty one here. Handing back the hidden copy
-		# would produce links that cannot be clicked and whose text is empty, so
-		# this has to fail loudly rather than return them.
+	def test_skips_empty_asin_placeholders(self):
+		cards = selectors_for(self._driver([
+			result_card(asin=""),
+			result_card(asin="B0ABC12345"),
+		])).get_search_result_cards()
+
+		self.assertEqual(len(cards), 1)
+		self.assertEqual(cards[0].get_dom_attribute("data-asin"), "B0ABC12345")
+
+	def test_skips_hidden_cards(self):
+		cards = selectors_for(self._driver([
+			result_card(asin="B0HIDDEN01", displayed=False),
+			result_card(asin="B0VISIBLE1"),
+		])).get_search_result_cards()
+
+		self.assertEqual(len(cards), 1)
+		self.assertEqual(cards[0].get_dom_attribute("data-asin"), "B0VISIBLE1")
+
+
+class CardExtraction(unittest.TestCase):
+	def test_extracts_title_author_price_and_canonical_url(self):
+		record = selectors_for(FakeDriver()).extract_card(
+			result_card(),
+			keyword="cozy mystery",
+		)
+
+		self.assertEqual(record["keyword"], "cozy mystery")
+		self.assertEqual(record["title"], "The Example Book")
+		self.assertEqual(record["author"], "Jane Doe")
+		self.assertEqual(record["asin"], "B0ABC12345")
+		self.assertEqual(record["url"], "https://www.amazon.com/dp/B0ABC12345")
+		self.assertEqual(record["price"], "$4.99")
+		self.assertFalse(record["sponsored"])
+
+	def test_author_falls_back_to_by_row_when_byline_recipe_is_missing(self):
+		card = result_card()
+		del card.children[(By.CSS_SELECTOR, '[data-cy="byline-recipe"]')]
+
+		record = selectors_for(FakeDriver()).extract_card(card)
+
+		self.assertEqual(record["author"], "Jane Doe")
+
+	def test_price_is_empty_when_the_card_has_no_price(self):
+		record = selectors_for(FakeDriver()).extract_card(result_card(price=""))
+
+		self.assertEqual(record["price"], "")
+
+	def test_returns_none_when_the_card_has_no_asin(self):
+		card = result_card(asin="", href="/s?k=mystery")
+
+		self.assertIsNone(selectors_for(FakeDriver()).extract_card(card))
+
+	def test_recovers_asin_from_the_title_href_when_data_asin_is_blank(self):
+		card = result_card(asin="", href="/Foo-ebook/dp/B0FROMHREF/ref=sr_1_2")
+
+		record = selectors_for(FakeDriver()).extract_card(card)
+
+		self.assertEqual(record["asin"], "B0FROMHREF")
+		self.assertEqual(record["url"], "https://www.amazon.com/dp/B0FROMHREF")
+
+
+class SponsoredFlag(unittest.TestCase):
+	def test_sponsored_span(self):
+		self.assertTrue(
+			selectors_for(FakeDriver()).card_is_sponsored(result_card(sponsored=True))
+		)
+
+	def test_organic_card_is_not_sponsored(self):
+		self.assertFalse(
+			selectors_for(FakeDriver()).card_is_sponsored(result_card(sponsored=False))
+		)
+
+	def test_adholder_class_without_label_is_still_sponsored(self):
+		card = result_card(sponsored=False, css_class="AdHolder")
+
+		self.assertTrue(selectors_for(FakeDriver()).card_is_sponsored(card))
+
+
+class NextPage(unittest.TestCase):
+	def _driver(self, links):
+		return FakeDriver(children={(By.CSS_SELECTOR, "a.s-pagination-next"): links})
+
+	def test_returns_the_enabled_next_link(self):
+		link = FakeElement(
+			text="Next",
+			attributes={"class": "s-pagination-item s-pagination-next s-pagination-button"},
+		)
+
+		self.assertIs(selectors_for(self._driver([link])).get_next_page_link(), link)
+
+	def test_skips_a_disabled_next_link(self):
+		link = FakeElement(
+			text="Next",
+			attributes={
+				"class": "s-pagination-item s-pagination-next s-pagination-disabled",
+				"aria-disabled": "true",
+			},
+		)
+
 		with self.assertRaises(NoSuchElementException):
-			selectors_for(self._driver(visible_links=0, hidden_links=7)).get_all_misc_cards()
+			selectors_for(self._driver([link])).get_next_page_link()
 
-	def test_uses_the_visible_copy_when_it_has_the_content(self):
-		cards = selectors_for(self._driver(visible_links=7, hidden_links=0)).get_all_misc_cards()
+	def test_skips_a_hidden_next_link(self):
+		link = FakeElement(
+			text="Next",
+			attributes={"class": "s-pagination-item s-pagination-next"},
+			displayed=False,
+		)
 
-		self.assertEqual(len(cards), 7)
-
-
-class DailySetOpener(unittest.TestCase):
-	"""The opener label has to be distinguished from the level up entry."""
-
-	def _driver(self, labels):
-		buttons = [FakeElement(text=text) for text in labels]
-
-		return FakeDriver(children={(By.TAG_NAME, "button"): buttons})
-
-	def test_matches_the_streak_button(self):
-		driver = self._driver([
-			"Complete the Daily Set for 7 days in a row",
-			"Daily Set Streak\nDay 2 of 7 streak completed.",
-		])
-
-		button = selectors_for(driver).get_open_daily_set_button()
-
-		self.assertIn("Daily Set Streak", button.text)
-
-	def test_does_not_match_the_level_up_entry_alone(self):
-		driver = self._driver(["Complete the Daily Set for 7 days in a row"])
-
-		# No streak button and no streaks section to fall back to.
 		with self.assertRaises(NoSuchElementException):
-			selectors_for(driver).get_open_daily_set_button()
+			selectors_for(self._driver([link])).get_next_page_link()
+
+
+class Interstitials(unittest.TestCase):
+	def test_captcha_from_url(self):
+		driver = FakeDriver(current_url="https://www.amazon.com/errors/validateCaptcha")
+
+		self.assertTrue(selectors_for(driver).is_captcha_page())
+
+	def test_captcha_from_form(self):
+		driver = FakeDriver(
+			children={(By.ID, "captchacharacters"): [FakeElement()]},
+		)
+
+		self.assertTrue(selectors_for(driver).is_captcha_page())
+
+	def test_home_is_not_a_captcha(self):
+		self.assertFalse(selectors_for(FakeDriver()).is_captcha_page())
+
+	def test_continue_shopping_button(self):
+		button = FakeElement(text="Continue shopping")
+		driver = FakeDriver(children={(By.TAG_NAME, "button"): [button]})
+
+		self.assertIs(selectors_for(driver).get_continue_shopping_button(), button)
+
+	def test_raises_when_there_is_no_continue_shopping_button(self):
+		with self.assertRaises(NoSuchElementException):
+			selectors_for(FakeDriver()).get_continue_shopping_button()
 
 
 if __name__ == "__main__":

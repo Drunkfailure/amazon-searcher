@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import re
 
 from selenium.webdriver.common.by import By
@@ -6,241 +8,267 @@ from selenium.common.exceptions import NoSuchElementException, StaleElementRefer
 from selenium import webdriver
 
 
-class Labels:
-	"""Visible labels the selectors match on.
+KINDLE_DEPARTMENT_VALUE = "search-alias=digital-text"
+AMAZON_HOME = "https://www.amazon.com/"
+PRODUCT_URL_TEMPLATE = "https://www.amazon.com/dp/{asin}"
 
-	The Rewards markup carries no stable hooks for these controls, so they have
-	to be found by their text. That makes the lookups language dependent even
-	though they are market independent: a Rewards UI rendered in another
-	language needs these translated, and there is exactly one place to do it.
+ASIN_RE = re.compile(r"(?:/dp/|/gp/product/)([A-Z0-9]{10})", re.IGNORECASE)
+ASIN_ONLY_RE = re.compile(r"^[A-Z0-9]{10}$", re.IGNORECASE)
 
-	Matching is case insensitive and by substring unless noted.
-	"""
 
-	POINTS_BREAKDOWN = "points breakdown"
-	READY_TO_CLAIM = "ready to claim"
-	CLAIM = "claim"                      # exact label preferred, substring as fallback
-	DAILY_SET_STREAK = "daily set streak"
-	CARD_COMPLETED = "completed"
-	# The full streak label on purpose: plain "visual search" also matches an
-	# element on the dashboard, which can go stale mid-interaction.
-	VISUAL_SEARCH_STREAK = "visual search streak"
+def asin_from_href(href: str) -> str | None:
+	"""Pull a 10-character ASIN out of an Amazon product href."""
+	if not href:
+		return None
+
+	match = ASIN_RE.search(href)
+
+	if match:
+		return match.group(1).upper()
+
+	return None
+
+
+def product_url(asin: str) -> str:
+	return PRODUCT_URL_TEMPLATE.format(asin=asin.upper())
+
+
+def normalize_asin(value: str) -> str | None:
+	"""Accept a raw ASIN or a product href and return a canonical ASIN."""
+	if not value:
+		return None
+
+	stripped = value.strip()
+
+	if ASIN_ONLY_RE.fullmatch(stripped):
+		return stripped.upper()
+
+	return asin_from_href(stripped)
 
 
 class ElementSelectionUtils:
-	"""Selectors for the Rewards UI.
+	"""Selectors for Amazon Kindle search.
 
-	These are deliberately semantic rather than positional. The Rewards page is
-	server-rendered React whose markup differs between markets and changes
-	between deploys, so absolute XPaths like
-	`/html/body/div[2]/div[2]/div/main/section[1]/...` resolve to nothing
-	outside the exact variant they were written against.
-
-	Two concrete cases this has to survive:
-
-	1. Outside en-US the page can render an extra `exploreonbing` section, which
-	   shifts every positional section index by one.
-	2. Some sections are emitted twice for responsive layout. The first match in
-	   document order can be the hidden, empty one, so container lookups must
-	   pick the copy that is visible and actually has content.
-
-	Anything the current variant does not ship raises NoSuchElementException so
-	the caller can skip that task instead of aborting the whole run.
+	Amazon's search markup shifts between deploys, so these lookups are
+	semantic: stable ids for the nav, data-asin / data-component-type for
+	result cards, and visible labels for captcha and continue-shopping.
+	Anything the current page does not ship raises NoSuchElementException so
+	the caller can wait, skip, or pause instead of aborting the whole run.
 	"""
 
 	def __init__(self, driver: webdriver.Edge):
 		self.driver = driver
 
-	# ------------------------------------------------------------------
-	# helpers
-	# ------------------------------------------------------------------
-
 	def resolve(self, xpath: str):
 		return self.driver.find_element(By.XPATH, xpath)
 
-	def _container_by_id(self, element_id: str) -> WebElement:
-		"""Return the usable copy of an id that may be present more than once.
+	# ------------------------------------------------------------------
+	# nav
+	# ------------------------------------------------------------------
 
-		Only a copy that is both visible and has content is usable. A hidden copy
-		still exposes its links to find_elements, but they cannot be clicked and
-		their `.text` is empty, so returning one produces silent no-ops further
-		up. Raising instead lets the caller's WebDriverWait retry while the page
-		finishes hydrating.
+	def get_search_box(self):
+		return self.driver.find_element(By.ID, "twotabsearchtextbox")
+
+	def get_search_submit(self):
+		return self.driver.find_element(By.ID, "nav-search-submit-button")
+
+	def get_department_dropdown(self):
+		return self.driver.find_element(By.ID, "searchDropdownBox")
+
+	# ------------------------------------------------------------------
+	# result cards
+	# ------------------------------------------------------------------
+
+	def get_search_result_cards(self):
+		"""Visible result cards that actually identify a product.
+
+		Amazon emits empty `data-asin` placeholders and a hidden responsive
+		copy of the list. Those are not harvestable: they have no product
+		and cannot be clicked, so they are dropped here.
 		"""
-		matches = self.driver.find_elements(By.ID, element_id)
+		matches = self.driver.find_elements(
+			By.CSS_SELECTOR, 'div[data-component-type="s-search-result"]'
+		)
 
-		if not matches:
-			raise NoSuchElementException(f"no element with id {element_id!r}")
+		cards = []
 
 		for match in matches:
 			try:
-				if match.is_displayed() and match.find_elements(By.TAG_NAME, "a"):
-					return match
+				asin = (match.get_dom_attribute("data-asin") or "").strip()
+
+				if asin and match.is_displayed():
+					cards.append(match)
 			except StaleElementReferenceException:
 				continue
 
-		raise NoSuchElementException(
-			f"{element_id!r} is present but no visible copy has content yet"
+		return cards
+
+	def extract_card(self, card: WebElement, keyword: str = "") -> dict | None:
+		asin = normalize_asin(card.get_dom_attribute("data-asin") or "")
+
+		if not asin:
+			href = self._title_href(card)
+			asin = normalize_asin(href or "")
+
+		if not asin:
+			return None
+
+		return {
+			"keyword": keyword,
+			"title": self.extract_title(card),
+			"author": self.extract_author(card),
+			"asin": asin,
+			"url": product_url(asin),
+			"price": self.extract_price(card),
+			"sponsored": self.card_is_sponsored(card),
+		}
+
+	def extract_title(self, card: WebElement) -> str:
+		for selector in ("h2 a", '[data-cy="title-recipe"] h2'):
+			try:
+				for node in card.find_elements(By.CSS_SELECTOR, selector):
+					text = (node.text or "").strip()
+
+					if text:
+						return text.split("\n")[0].strip()
+			except StaleElementReferenceException:
+				continue
+
+		return ""
+
+	def extract_author(self, card: WebElement) -> str:
+		try:
+			byline = card.find_element(By.CSS_SELECTOR, '[data-cy="byline-recipe"]')
+			text = (byline.text or "").strip()
+
+			if text:
+				return self._author_from_byline(text)
+		except (NoSuchElementException, StaleElementReferenceException):
+			pass
+
+		try:
+			for row in card.find_elements(By.CSS_SELECTOR, ".a-row"):
+				text = (row.text or "").strip()
+
+				if text.lower().startswith("by "):
+					return self._author_from_byline(text)
+		except StaleElementReferenceException:
+			pass
+
+		return ""
+
+	def extract_price(self, card: WebElement) -> str:
+		try:
+			for price in card.find_elements(By.CSS_SELECTOR, ".a-price .a-offscreen"):
+				try:
+					text = (price.text or "").strip()
+
+					if text and price.is_displayed():
+						return text
+				except StaleElementReferenceException:
+					continue
+		except StaleElementReferenceException:
+			pass
+
+		return ""
+
+	def card_is_sponsored(self, card: WebElement) -> bool:
+		cls = card.get_dom_attribute("class") or ""
+
+		if "AdHolder" in cls:
+			return True
+
+		try:
+			for span in card.find_elements(By.TAG_NAME, "span"):
+				try:
+					if (span.text or "").strip().lower() == "sponsored":
+						return True
+				except StaleElementReferenceException:
+					continue
+		except StaleElementReferenceException:
+			pass
+
+		return False
+
+	def _title_href(self, card: WebElement) -> str:
+		try:
+			link = card.find_element(By.CSS_SELECTOR, "h2 a")
+		except (NoSuchElementException, StaleElementReferenceException):
+			return ""
+
+		return (
+			link.get_dom_attribute("href")
+			or (link.get_attribute("href") if hasattr(link, "get_attribute") else None)
+			or ""
 		)
 
-	def _button_containing(self, needle: str, root: WebElement = None) -> WebElement:
-		"""First button whose visible text contains `needle` (case-insensitive)."""
-		scope = self.driver if root is None else root
-		needle = needle.lower()
+	@staticmethod
+	def _author_from_byline(text: str) -> str:
+		stripped = text.strip()
 
-		for button in scope.find_elements(By.TAG_NAME, "button"):
+		if stripped.lower().startswith("by "):
+			stripped = stripped[3:]
+
+		return stripped.split("\n")[0].strip()
+
+	# ------------------------------------------------------------------
+	# pagination
+	# ------------------------------------------------------------------
+
+	def get_next_page_link(self):
+		candidates = self.driver.find_elements(By.CSS_SELECTOR, "a.s-pagination-next")
+
+		for link in candidates:
 			try:
-				if needle in (button.text or "").lower():
-					return button
-			except StaleElementReferenceException:
-				continue
+				cls = link.get_dom_attribute("class") or ""
+				aria = (link.get_dom_attribute("aria-disabled") or "").lower()
 
-		raise NoSuchElementException(f"no button containing {needle!r}")
+				if "s-pagination-disabled" in cls or aria == "true":
+					continue
 
-	def _link_containing(self, needle: str, root: WebElement = None) -> WebElement:
-		scope = self.driver if root is None else root
-		needle = needle.lower()
-
-		for link in scope.find_elements(By.TAG_NAME, "a"):
-			try:
-				if needle in (link.text or "").lower():
+				if link.is_displayed():
 					return link
 			except StaleElementReferenceException:
 				continue
 
-		raise NoSuchElementException(f"no link containing {needle!r}")
+		raise NoSuchElementException("no enabled next page link")
 
 	# ------------------------------------------------------------------
-	# navigation
+	# interstitials
 	# ------------------------------------------------------------------
 
-	def get_earn_tab(self):
-		# The react-aria prefix is generated per build, so match on the suffix.
-		return self.driver.find_element(By.CSS_SELECTOR, '[id$="-tab-/earn"]')
+	def is_captcha_page(self) -> bool:
+		url = (getattr(self.driver, "current_url", "") or "").lower()
 
-	def get_dashboard_tab(self):
-		return self.driver.find_element(By.CSS_SELECTOR, '[id$="-tab-/dashboard"]')
+		if "validatecaptcha" in url or "/sorry/" in url:
+			return True
 
-	def get_sidebar_section(self):
-		for section in self.driver.find_elements(By.TAG_NAME, "section"):
-			try:
-				# get_dom_attribute returns None for sections without an id,
-				# so normalise before comparing.
-				if (section.get_dom_attribute("id") or "").startswith("react-aria"):
-					return section
-			except StaleElementReferenceException:
-				continue
+		if self.driver.find_elements(By.ID, "captchacharacters"):
+			return True
 
-		raise NoSuchElementException("sidebar section not found")
+		if self.driver.find_elements(By.CSS_SELECTOR, "form[action*='validateCaptcha']"):
+			return True
 
-	# ------------------------------------------------------------------
-	# daily set
-	# ------------------------------------------------------------------
+		return False
 
-	def _streaks_button(self, index: int) -> WebElement:
-		"""Positional fallback inside the streaks section.
+	def get_continue_shopping_button(self):
+		for tag in ("button", "a", "input"):
+			for element in self.driver.find_elements(By.TAG_NAME, tag):
+				try:
+					label = (element.text or "").strip().lower()
+					value = (element.get_dom_attribute("value") or "").strip().lower()
 
-		Same node the original absolute XPath pointed at, but anchored on the
-		section id so an extra section earlier in the page cannot shift it.
-		"""
-		streaks = self.driver.find_element(By.ID, "streaks")
+					if "continue shopping" in label or "continue shopping" in value:
+						if element.is_displayed():
+							return element
+				except StaleElementReferenceException:
+					continue
 
-		return streaks.find_element(By.XPATH, f"./div/div[2]/div/div/button[{index}]")
-
-	def get_open_daily_set_button(self):
-		# Lives in the streaks section, not in a section of its own. Match on
-		# "daily set streak" rather than "daily set", because the level up
-		# section also has "Complete the Daily Set for 7 days in a row".
-		try:
-			return self._button_containing(Labels.DAILY_SET_STREAK)
-		except NoSuchElementException:
-			return self._streaks_button(3)
-
-	def get_daily_set_elements(self):
-		# The first link in the opened panel is the progress row, not an activity.
-		return self.get_sidebar_section().find_elements(By.TAG_NAME, "a")[1:]
+		raise NoSuchElementException("no continue shopping button")
 
 	# ------------------------------------------------------------------
-	# explore on bing (absent in en-US, present in some other markets)
+	# viewport
 	# ------------------------------------------------------------------
-
-	def get_explore_on_bing_elements(self):
-		try:
-			container = self._container_by_id("exploreonbing")
-		except NoSuchElementException:
-			return []
-
-		return container.find_elements(By.TAG_NAME, "a")
-
-	# ------------------------------------------------------------------
-	# visual search
-	# ------------------------------------------------------------------
-
-	def get_open_visual_search_sidebar(self):
-		try:
-			return self._button_containing(Labels.VISUAL_SEARCH_STREAK)
-		except NoSuchElementException:
-			# Not every layout ships this entry point. Where it does but the
-			# label differs, fall back to the original position in streaks.
-			return self._streaks_button(5)
-
-	def get_search_now_link_from_visual_search_sidebar(self):
-		sidebar = self.get_sidebar_section()
-
-		try:
-			return self._link_containing("search now", sidebar)
-		except NoSuchElementException:
-			# Fall back to the original positional behaviour.
-			links = sidebar.find_elements(By.TAG_NAME, "a")
-
-			if len(links) < 2:
-				raise NoSuchElementException("visual search sidebar has no usable link")
-
-			return links[1]
-
-	def get_visual_search_button(self):
-		return self.driver.find_element(By.CSS_SELECTOR, "#sb_form > div.camera.icon")
-
-	def get_visual_search_file_input(self):
-		return self.driver.find_element(By.CSS_SELECTOR, "#sb_fileinput")
-
-	# ------------------------------------------------------------------
-	# cards
-	# ------------------------------------------------------------------
-
-	def get_all_misc_cards(self):
-		return self._container_by_id("moreactivities").find_elements(By.TAG_NAME, "a")
-
-	def extract_card_descriptions(self, card: WebElement):
-		try:
-			return card.find_element(By.CSS_SELECTOR, "p:nth-child(2)").text
-		except NoSuchElementException:
-			paragraphs = card.find_elements(By.TAG_NAME, "p")
-
-			return paragraphs[1].text if len(paragraphs) > 1 else (card.text or "")
-
-	def _card_status_element(self, card: WebElement):
-		return card.find_element(By.CSS_SELECTOR, "div.flex.w-full.items-center.gap-2")
-
-	def card_is_complete(self, card: WebElement):
-		try:
-			status = self._card_status_element(card).text
-		except NoSuchElementException:
-			return False
-
-		return Labels.CARD_COMPLETED in (status or "").lower()
-
-	def get_card_point_value(self, card: WebElement):
-		try:
-			elem = self._card_status_element(card).find_element(By.TAG_NAME, "p")
-		except NoSuchElementException:
-			return 0
-
-		# Rendered as "+10", and other variants add a unit, so pull the digits out
-		# rather than relying on int() accepting the exact string.
-		digits = re.search(r"\d+", elem.text or "")
-
-		return int(digits.group()) if digits else 0
 
 	def element_is_fully_in_viewport(self, elem: WebElement) -> bool:
 		js_viewport_check = """
@@ -256,104 +284,3 @@ return (
 """
 
 		return self.driver.execute_script(js_viewport_check, elem)
-
-	# ------------------------------------------------------------------
-	# points breakdown
-	# ------------------------------------------------------------------
-
-	def get_points_breakdown_button(self):
-		return self._button_containing(Labels.POINTS_BREAKDOWN)
-
-	def get_close_button_on_points_breakdown(self):
-		return self.get_generic_sidebar_close_button()
-
-	def get_points_earned_from_searches_on_points_breakdown(self):
-		"""Return (earned, max) for the Bing search row of the breakdown panel.
-
-		The value renders as two spans, "3" and "/15", so an XPath on text()
-		matches only the second half. Read the panel's rendered text instead and
-		anchor on the row label, because several rows share the same value class
-		and a reordering would otherwise silently return the wrong number.
-		"""
-		sidebar = self.get_sidebar_section()
-		text = sidebar.text or ""
-		lines = [line.strip() for line in text.splitlines()]
-
-		def parse(candidate: str):
-			match = re.fullmatch(r"([\d,]+)\s*/\s*([\d,]+)", candidate)
-
-			if not match:
-				return None
-
-			return int(match.group(1).replace(",", "")), int(match.group(2).replace(",", ""))
-
-		for index, line in enumerate(lines):
-			if "bing search" in line.lower():
-				for candidate in lines[index + 1:index + 3]:
-					parsed = parse(candidate)
-
-					if parsed:
-						return parsed
-
-		# Fall back to the first fraction anywhere in the panel.
-		match = re.search(r"([\d,]+)\s*/\s*([\d,]+)", text)
-
-		if match:
-			return int(match.group(1).replace(",", "")), int(match.group(2).replace(",", ""))
-
-		raise NoSuchElementException("no points fraction found in the breakdown sidebar")
-
-	# ------------------------------------------------------------------
-	# bonus
-	# ------------------------------------------------------------------
-
-	def get_bonus_button_on_dashboard(self):
-		return self._button_containing(Labels.READY_TO_CLAIM)
-
-	def get_claim_bonus_points_button(self):
-		sidebar = self.get_sidebar_section()
-		buttons = sidebar.find_elements(By.TAG_NAME, "button")
-
-		# Prefer the button whose whole label is the action. A substring match
-		# would hit the "Ready to claim" heading before the actual Claim button.
-		for button in buttons:
-			try:
-				if (button.text or "").strip().lower() == Labels.CLAIM:
-					return button
-			except StaleElementReferenceException:
-				continue
-
-		for button in buttons:
-			try:
-				if Labels.CLAIM in (button.text or "").lower():
-					return button
-			except StaleElementReferenceException:
-				continue
-
-		if len(buttons) < 3:
-			raise NoSuchElementException("bonus sidebar has no claim button")
-
-		return buttons[2]
-
-	def get_generic_sidebar_close_button(self):
-		sidebar = self.get_sidebar_section()
-
-		try:
-			return sidebar.find_element(By.CSS_SELECTOR, "button[aria-label*='lose']")
-		except NoSuchElementException:
-			buttons = sidebar.find_elements(By.TAG_NAME, "button")
-
-			if not buttons:
-				raise NoSuchElementException("sidebar has no buttons")
-
-			return buttons[0]
-
-	# ------------------------------------------------------------------
-	# bing search page
-	# ------------------------------------------------------------------
-
-	def get_bing_search_bar(self):
-		return self.driver.find_element(By.TAG_NAME, "textarea")
-
-	def get_clear_bing_search_query_button(self):
-		return self.driver.find_element(By.ID, "sw_clx")

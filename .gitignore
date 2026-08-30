@@ -5,4 +5,5 @@ visual_search.json
 !nouns.txt
 Todo.md
 data-dir/
+harvested/
 __pycache__/

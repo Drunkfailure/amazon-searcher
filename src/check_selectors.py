@@ -1,16 +1,15 @@
-"""Report which selectors resolve against the Rewards UI you actually get.
+"""Report which Amazon Kindle selectors resolve against the page you actually get.
 
-The Rewards markup differs between markets and changes between deploys, so a
-selector that works for one account silently finds nothing for another. This
-walks every selector and prints what resolved, what is absent, and what broke.
+Amazon's search markup changes between deploys, so a selector that works one
+week can silently find nothing the next. This walks the harvest selectors and
+prints what resolved, what is absent, and what broke.
 
-It completes no activities and claims no points. It only reads, and opens the
-points breakdown and daily set panels, which award nothing.
+It does not type queries or write a harvest file. It only reads amazon.com
+and a Kindle search results page.
 
 	poetry run python src/check_selectors.py
 
-Paste the output into a bug report. Absent is a normal result for a task the
-variant does not ship. FAILED is what needs fixing.
+Paste the output into a bug report. FAILED is what needs fixing.
 """
 
 import sys
@@ -23,6 +22,7 @@ import element_selectors
 from constants import USER_DATA_DIR, PROFILE_NAME
 
 RENDER_TIMEOUT = 60
+KINDLE_RESULTS_URL = "https://www.amazon.com/s?k=mystery&i=digital-text"
 
 
 def build_driver():
@@ -73,8 +73,10 @@ class Report:
 			if not value and optional:
 				self.record(name, "ABSENT", "0 elements")
 				return value
-		elif isinstance(value, tuple):
+		elif isinstance(value, bool):
 			detail = str(value)
+		elif isinstance(value, dict):
+			detail = repr(value.get("title") or value.get("asin") or value)[:44]
 		else:
 			try:
 				detail = repr((value.text or "").replace("\n", " | ")[:44])
@@ -95,7 +97,7 @@ class Report:
 		return counts["FAILED"]
 
 
-def describe_environment(driver, report):
+def describe_environment(driver):
 	print("\n## environment")
 
 	caps = driver.capabilities
@@ -104,18 +106,9 @@ def describe_environment(driver, report):
 	print(f"  msedgedriver   {caps.get('msedge', {}).get('msedgedriverVersion', '?').split(' ')[0]}")
 	print(f"  selenium       {getattr(__import__('selenium'), '__version__', '?')}")
 	print(f"  python         {sys.version.split()[0]}")
+	print(f"  url            {driver.current_url}")
 	print(f"  page lang      {driver.find_element(By.TAG_NAME, 'html').get_attribute('lang')!r}")
 	print(f"  viewport       {driver.execute_script('return [window.innerWidth, window.innerHeight];')}")
-
-	sections = [
-		s.get_dom_attribute("id")
-		for s in driver.find_elements(By.XPATH, "/html/body/div[2]/div[2]/div/main/section")
-	]
-	print(f"  earn sections  {sections}")
-
-	duplicates = [i for i in set(sections) if i and sections.count(i) > 1]
-	if duplicates:
-		print(f"  duplicated ids {duplicates}")
 
 
 def main():
@@ -124,101 +117,56 @@ def main():
 	report = Report()
 
 	try:
-		driver.get("https://rewards.bing.com/earn")
+		driver.get(element_selectors.AMAZON_HOME)
 
-		rendered = wait_until(lambda: elements.get_points_breakdown_button() is not None)
-
-		if not rendered:
-			print("The earn page never finished rendering.")
-			print("In the EU the cookie consent banner blocks it until answered, and it")
-			print("cannot be dismissed reliably from selenium. Open the profile in a")
-			print("normal Edge window, answer the banner once, then run this again.")
+		if elements.is_captcha_page():
+			print("Amazon is showing a captcha. Solve it in the browser, then re-run.")
 			return 2
 
-		describe_environment(driver, report)
+		rendered = wait_until(lambda: elements.get_search_box() is not None)
 
-		print("\n## navigation")
-		report.check("get_earn_tab", elements.get_earn_tab)
-		report.check("get_dashboard_tab", elements.get_dashboard_tab)
-		report.check("get_points_breakdown_button", elements.get_points_breakdown_button)
+		if not rendered:
+			print("amazon.com never finished rendering the search box.")
+			print("A captcha, continue-shopping wall, or cookie banner may be blocking it.")
+			print("Open the profile in a normal Edge window, dismiss it, then run this again.")
+			return 2
 
-		print("\n## daily set")
-		opener = report.check("get_open_daily_set_button", elements.get_open_daily_set_button)
+		describe_environment(driver)
 
-		if opener is not None:
-			driver.execute_script("arguments[0].scrollIntoView({block:'center'});", opener)
-			time.sleep(1)
-			driver.execute_script("arguments[0].click();", opener)
-			wait_until(lambda: elements.get_sidebar_section() is not None, 30)
-			report.check("get_daily_set_elements", elements.get_daily_set_elements)
+		print("\n## home")
+		report.check("get_search_box", elements.get_search_box)
+		report.check("get_search_submit", elements.get_search_submit)
+		report.check("get_department_dropdown", elements.get_department_dropdown)
+		report.check("is_captcha_page", elements.is_captcha_page)
+		report.check("get_continue_shopping_button", elements.get_continue_shopping_button, optional=True)
 
-			try:
-				driver.execute_script(
-					"arguments[0].click();", elements.get_generic_sidebar_close_button()
-				)
-				time.sleep(2)
-			except Exception:
-				driver.get("https://rewards.bing.com/earn")
-				wait_until(lambda: elements.get_points_breakdown_button() is not None)
+		print("\n## kindle results")
+		driver.get(KINDLE_RESULTS_URL)
 
-		print("\n## optional tasks")
-		report.check("get_explore_on_bing_elements", elements.get_explore_on_bing_elements, optional=True)
-		report.check("get_open_visual_search_sidebar", elements.get_open_visual_search_sidebar, optional=True)
+		if elements.is_captcha_page():
+			print("Amazon is showing a captcha on the results page. Solve it, then re-run.")
+			return 2
 
-		print("\n## cards")
-		cards = report.check("get_all_misc_cards", elements.get_all_misc_cards)
+		wait_until(lambda: bool(elements.get_search_result_cards()), 30)
+		cards = report.check("get_search_result_cards", elements.get_search_result_cards)
+		report.check("get_next_page_link", elements.get_next_page_link, optional=True)
 
 		if cards:
-			for index, card in enumerate(cards, start=1):
-				try:
-					points = elements.get_card_point_value(card)
-					done = elements.card_is_complete(card)
-					description = elements.extract_card_descriptions(card)[:38]
-					print(f"    card[{index}] points={points:<4} completed={done!s:<5} {description!r}")
-				except Exception as exc:
-					print(f"    card[{index}] unreadable: {type(exc).__name__}")
-
-		print("\n## points breakdown")
-		driver.get("https://rewards.bing.com/earn")
-		wait_until(lambda: elements.get_points_breakdown_button() is not None)
-		driver.execute_script("arguments[0].click();", elements.get_points_breakdown_button())
-		wait_until(lambda: elements.get_sidebar_section() is not None, 30)
-
-		# The section exists before it has content: the panel renders a
-		# "Loading..." placeholder inside it first, and that satisfies the
-		# presence check above immediately. Waiting only for the section leaves
-		# the two selectors below reading an empty panel, so they report FAILED
-		# for markup that is fine, on a page that is merely slow. Wait for the
-		# content itself. A selector that really is broken still reports FAILED,
-		# it just costs the timeout first.
-		wait_until(
-			lambda: elements.get_points_earned_from_searches_on_points_breakdown() is not None,
-			30,
-		)
-
-		report.check("get_sidebar_section", elements.get_sidebar_section)
-		report.check(
-			"get_points_earned_from_searches_on_points_breakdown",
-			elements.get_points_earned_from_searches_on_points_breakdown,
-		)
-		report.check("get_close_button_on_points_breakdown", elements.get_close_button_on_points_breakdown)
-
-		print("\n## bonus")
-		driver.get("https://rewards.bing.com/dashboard")
-		wait_until(lambda: elements.get_bonus_button_on_dashboard() is not None, 30)
-		report.check("get_bonus_button_on_dashboard", elements.get_bonus_button_on_dashboard, optional=True)
-
-		print("\n## bing")
-		driver.get("https://www.bing.com/")
-		wait_until(lambda: bool(driver.find_elements(By.TAG_NAME, "textarea")), 30)
-		report.check("get_bing_search_bar", elements.get_bing_search_bar)
+			sample = cards[0]
+			parsed = elements.extract_card(sample, keyword="mystery")
+			print(f"    sample title     {parsed.get('title')!r}" if parsed else "    sample unreadable")
+			print(f"    sample author    {parsed.get('author')!r}" if parsed else "")
+			print(f"    sample asin      {parsed.get('asin')!r}" if parsed else "")
+			print(f"    sample url       {parsed.get('url')!r}" if parsed else "")
+			print(f"    sample price     {parsed.get('price')!r}" if parsed else "")
+			print(f"    sample sponsored {parsed.get('sponsored')!r}" if parsed else "")
 
 		failures = report.summary()
 
 		if failures:
 			print("\nFAILED entries are selectors that should have resolved on this page.")
 		else:
-			print("\nEvery selector that this variant ships resolved.")
+			print("\nEvery required selector resolved.")
 
 		return 1 if failures else 0
 	finally:
